@@ -1,0 +1,21 @@
+# Node
+client/node_modules/
+client/dist/
+npm-debug.log*
+
+# Python
+server/.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Cache/DB
+server/cratebuddy_cache.sqlite3
+
+# Env files
+client/.env
+client/.env.*
+
+# OS
+.DS_Store
