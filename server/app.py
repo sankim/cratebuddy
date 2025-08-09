@@ -21,7 +21,7 @@ TTL_COLLECTION = 60 * 60 * 24
 # More realistic browser headers to avoid 403 errors
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "DNT": "1",
@@ -30,8 +30,12 @@ HEADERS = {
     "Sec-Fetch-Dest": "document",
     "Sec-Fetch-Mode": "navigate",
     "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
     "Cache-Control": "max-age=0",
-    "Referer": "https://bandcamp.com/"
+    "Referer": "https://bandcamp.com/",
+    "sec-ch-ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"'
 }
 
 # Multiple User-Agent strings to rotate through
@@ -40,7 +44,8 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 ]
 
 def get_random_user_agent():
@@ -86,49 +91,64 @@ def cache_set(key: str, value):
 
 BC_FAN_RE = re.compile(r"https?://bandcamp\.com/([A-Za-z0-9_-]+)$")
 
-def make_request_with_retry(url: str, max_retries: int = None, delay: float = None):
-    """Make HTTP request with retry logic and better error handling"""
+def make_request_with_retry(url, max_retries=None, base_delay=None):
+    """Make HTTP request with retry logic for 403/429 errors"""
     if max_retries is None:
         max_retries = MAX_RETRIES
-    if delay is None:
-        delay = BASE_DELAY
-        
-    for attempt in range(max_retries):
+    if base_delay is None:
+        base_delay = BASE_DELAY
+    
+    for attempt in range(max_retries + 1):
         try:
-            # Add some randomization to the delay to avoid pattern detection
+            # Add random delay between requests to avoid detection
             if attempt > 0:
-                time.sleep(delay + (attempt * 0.5) + (random.random() * 1.0))
+                delay = base_delay * (2 ** attempt) + random.uniform(0.5, 2.0)
+                time.sleep(delay)
+                print(f"Retry attempt {attempt + 1}/{max_retries + 1} after {delay:.2f}s delay")
             
-            # Use a random User-Agent for each request
-            session.headers.update({"User-Agent": get_random_user_agent()})
-            r = session.get(url, timeout=20)
+            # Use different User-Agent for each attempt
+            current_headers = HEADERS.copy()
+            current_headers["User-Agent"] = get_random_user_agent()
             
+            # Add some randomization to headers
+            if random.random() > 0.5:
+                current_headers["Accept-Language"] = "en-US,en;q=0.9,es;q=0.8"
+            
+            # Make request with current session and headers
+            r = session.get(url, headers=current_headers, timeout=30)
+            
+            # If successful, return response
             if r.status_code == 200:
                 return r
-            elif r.status_code == 403:
-                # If we get blocked, wait longer and try again
-                if attempt < max_retries - 1:
-                    time.sleep(delay * (attempt + 1) * 2)
+            
+            # Handle specific error codes
+            if r.status_code == 403:
+                if attempt < max_retries:
+                    print(f"403 Forbidden on attempt {attempt + 1}, retrying...")
                     continue
                 else:
-                    raise RuntimeError(f"Access blocked by Bandcamp (403) after {max_retries} attempts")
+                    raise RuntimeError(f"Access blocked by Bandcamp (403) after {max_retries + 1} attempts")
+            
             elif r.status_code == 429:
-                # Rate limited, wait longer
-                if attempt < max_retries - 1:
-                    time.sleep(delay * (attempt + 1) * 3)
+                if attempt < max_retries:
+                    delay = base_delay * (3 ** attempt) + random.uniform(2.0, 5.0)
+                    print(f"429 Too Many Requests on attempt {attempt + 1}, waiting {delay:.2f}s...")
+                    time.sleep(delay)
                     continue
                 else:
-                    raise RuntimeError(f"Rate limited by Bandcamp (429) after {max_retries} attempts")
-            else:
-                return r
-                
+                    raise RuntimeError(f"Rate limited by Bandcamp (429) after {max_retries + 1} attempts")
+            
+            # For other status codes, return the response
+            return r
+            
         except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1:
+            if attempt < max_retries:
+                print(f"Request failed on attempt {attempt + 1}: {e}")
                 continue
             else:
-                raise RuntimeError(f"Request failed after {max_retries} attempts: {str(e)}")
+                raise RuntimeError(f"Request failed after {max_retries + 1} attempts: {e}")
     
-    raise RuntimeError(f"Failed to fetch {url} after {max_retries} attempts")
+    raise RuntimeError(f"Max retries ({max_retries}) exceeded")
 
 def normalize_input(inp: str) -> str:
     inp = inp.strip()
@@ -313,22 +333,85 @@ def healthz():
 @app.route("/test-scraping")
 def test_scraping():
     """Test endpoint to debug scraping issues"""
-    try:
-        # Test with a simple, public Bandcamp page
-        test_url = "https://bandcamp.com/"
-        r = make_request_with_retry(test_url, max_retries=1)
-        return jsonify({
-            "status": "success",
-            "status_code": r.status_code,
-            "content_length": len(r.text),
-            "headers": dict(r.headers)
-        })
-    except Exception as e:
-        return jsonify({
-            "status": "error",
-            "error": str(e),
-            "error_type": type(e).__name__
-        }), 500
+    results = []
+    
+    # Test different URLs and strategies
+    test_urls = [
+        "https://bandcamp.com/",
+        "https://bandcamp.com/explore",
+        "https://bandcamp.com/tags"
+    ]
+    
+    for i, test_url in enumerate(test_urls):
+        try:
+            print(f"Testing URL {i+1}: {test_url}")
+            
+            # Try with different User-Agents
+            for attempt in range(2):
+                try:
+                    headers = HEADERS.copy()
+                    headers["User-Agent"] = get_random_user_agent()
+                    
+                    print(f"  Attempt {attempt+1} with User-Agent: {headers['User-Agent'][:50]}...")
+                    
+                    r = session.get(test_url, headers=headers, timeout=30)
+                    
+                    results.append({
+                        "url": test_url,
+                        "attempt": attempt + 1,
+                        "status_code": r.status_code,
+                        "content_length": len(r.text),
+                        "user_agent": headers["User-Agent"][:50] + "...",
+                        "success": r.status_code == 200
+                    })
+                    
+                    if r.status_code == 200:
+                        print(f"  ✅ Success! Status: {r.status_code}, Length: {len(r.text)}")
+                        break
+                    else:
+                        print(f"  ❌ Failed! Status: {r.status_code}")
+                        
+                except Exception as e:
+                    print(f"  ❌ Exception: {e}")
+                    results.append({
+                        "url": test_url,
+                        "attempt": attempt + 1,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "success": False
+                    })
+            
+            # Add delay between different URLs
+            if i < len(test_urls) - 1:
+                time.sleep(2)
+                
+        except Exception as e:
+            results.append({
+                "url": test_url,
+                "error": str(e),
+                "error_type": type(e).__name__,
+                "success": False
+            })
+    
+    # Summary
+    successful = sum(1 for r in results if r.get("success", False))
+    total = len(results)
+    
+    return jsonify({
+        "status": "success" if successful > 0 else "error",
+        "summary": {
+            "total_tests": total,
+            "successful": successful,
+            "failed": total - successful
+        },
+        "results": results,
+        "recommendations": [
+            "Use longer delays between requests" if successful == 0 else "Some strategies working",
+            "Try different IP addresses if all fail",
+            "Consider using a proxy service",
+            "Implement request rate limiting"
+        ] if successful == 0 else []
+    })
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
