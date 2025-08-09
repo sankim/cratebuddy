@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: cratebuddy-api
+    env: python
+    plan: free
+    buildCommand: pip install -r server/requirements.txt
+    startCommand: gunicorn app:app --chdir server --bind 0.0.0.0:$PORT --workers 2 --threads 4
+    envVars:
+      - key: ALLOW_ORIGIN
+        value: "*"
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: cache
+      mountPath: /var/data
+      sizeGB: 1
