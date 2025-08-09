@@ -4,20 +4,57 @@ import os, re, time, json, sqlite3, hashlib
 import requests
 from bs4 import BeautifulSoup
 from collections import defaultdict
+import random
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": os.environ.get("ALLOW_ORIGIN", "*")}})
 
+# Configuration from environment variables
 DATA_DIR = os.environ.get("DATA_DIR", ".")
 CACHE_DB = os.path.join(DATA_DIR, "cratebuddy_cache.sqlite3")
-HEADERS = {"User-Agent": "Mozilla/5.0 (Cratebuddy/1.0; +https://cratebuddy.example)"}
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
+BASE_DELAY = float(os.environ.get("BASE_DELAY", "2.0"))
+REQUEST_GAP = float(os.environ.get("REQUEST_GAP", "0.8"))
+TTL_TRALBUM = 60 * 60 * 24 * 7
+TTL_COLLECTION = 60 * 60 * 24
+
+# More realistic browser headers to avoid 403 errors
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Cache-Control": "max-age=0",
+    "Referer": "https://bandcamp.com/"
+}
+
+# Multiple User-Agent strings to rotate through
+USER_AGENTS = [
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15"
+]
+
+def get_random_user_agent():
+    """Get a random User-Agent string to avoid pattern detection"""
+    return random.choice(USER_AGENTS)
+
+# Create a session for persistent cookies and connection pooling
+session = requests.Session()
+session.headers.update(HEADERS)
+
 WEIGHTS = {"copurchase": 0.6, "label_artist": 0.3, "tags": 0.1}
 MAX_FANS = 25
 MAX_FAN_PURCHASES = 40
 MAX_SEED_ITEMS = 25
-REQUEST_GAP = 0.8
-TTL_TRALBUM = 60 * 60 * 24 * 7
-TTL_COLLECTION = 60 * 60 * 24
 
 # Cache (SQLite KV)
 def _db():
@@ -49,6 +86,50 @@ def cache_set(key: str, value):
 
 BC_FAN_RE = re.compile(r"https?://bandcamp\.com/([A-Za-z0-9_-]+)$")
 
+def make_request_with_retry(url: str, max_retries: int = None, delay: float = None):
+    """Make HTTP request with retry logic and better error handling"""
+    if max_retries is None:
+        max_retries = MAX_RETRIES
+    if delay is None:
+        delay = BASE_DELAY
+        
+    for attempt in range(max_retries):
+        try:
+            # Add some randomization to the delay to avoid pattern detection
+            if attempt > 0:
+                time.sleep(delay + (attempt * 0.5) + (random.random() * 1.0))
+            
+            # Use a random User-Agent for each request
+            session.headers.update({"User-Agent": get_random_user_agent()})
+            r = session.get(url, timeout=20)
+            
+            if r.status_code == 200:
+                return r
+            elif r.status_code == 403:
+                # If we get blocked, wait longer and try again
+                if attempt < max_retries - 1:
+                    time.sleep(delay * (attempt + 1) * 2)
+                    continue
+                else:
+                    raise RuntimeError(f"Access blocked by Bandcamp (403) after {max_retries} attempts")
+            elif r.status_code == 429:
+                # Rate limited, wait longer
+                if attempt < max_retries - 1:
+                    time.sleep(delay * (attempt + 1) * 3)
+                    continue
+                else:
+                    raise RuntimeError(f"Rate limited by Bandcamp (429) after {max_retries} attempts")
+            else:
+                return r
+                
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                continue
+            else:
+                raise RuntimeError(f"Request failed after {max_retries} attempts: {str(e)}")
+    
+    raise RuntimeError(f"Failed to fetch {url} after {max_retries} attempts")
+
 def normalize_input(inp: str) -> str:
     inp = inp.strip()
     m = BC_FAN_RE.match(inp)
@@ -62,7 +143,7 @@ def get_user_collection(username: str):
         return cached
 
     url = f"https://bandcamp.com/{username}"
-    r = requests.get(url, headers=HEADERS, timeout=20)
+    r = make_request_with_retry(url)
     if r.status_code != 200:
         raise RuntimeError(f"User page not reachable: {r.status_code}")
     soup = BeautifulSoup(r.text, "html.parser")
@@ -93,7 +174,7 @@ def parse_tralbum(url: str):
     if cached is not None:
         return cached
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = make_request_with_retry(url)
         if r.status_code != 200:
             return None
         soup = BeautifulSoup(r.text, "html.parser")
@@ -214,12 +295,40 @@ def api_recommend():
     try:
         recs = recommend(inp)
         return jsonify({"recommendations": recs})
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "403" in error_msg or "blocked" in error_msg.lower():
+            return jsonify({"error": "Bandcamp is temporarily blocking our requests. Please try again in a few minutes."}), 429
+        elif "429" in error_msg or "rate limited" in error_msg.lower():
+            return jsonify({"error": "Too many requests. Please wait a moment and try again."}), 429
+        else:
+            return jsonify({"error": error_msg}), 500
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"An unexpected error occurred: {str(e)}"}), 500
 
 @app.route("/healthz")
 def healthz():
-    return {"ok": True}
+    return jsonify({"status": "ok", "timestamp": int(time.time())})
+
+@app.route("/test-scraping")
+def test_scraping():
+    """Test endpoint to debug scraping issues"""
+    try:
+        # Test with a simple, public Bandcamp page
+        test_url = "https://bandcamp.com/"
+        r = make_request_with_retry(test_url, max_retries=1)
+        return jsonify({
+            "status": "success",
+            "status_code": r.status_code,
+            "content_length": len(r.text),
+            "headers": dict(r.headers)
+        })
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "error_type": type(e).__name__
+        }), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))

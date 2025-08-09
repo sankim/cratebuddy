@@ -10,6 +10,12 @@ services:
         value: "*"
       - key: DATA_DIR
         value: /var/data
+      - key: MAX_RETRIES
+        value: "3"
+      - key: BASE_DELAY
+        value: "2.0"
+      - key: REQUEST_GAP
+        value: "1.0"
     disk:
       name: cache
       mountPath: /var/data
